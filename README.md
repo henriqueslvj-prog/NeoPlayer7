@@ -15,22 +15,16 @@ Também mantém a reescrita de manifests HLS e URLs de segmentos pelo proxy.
 - `src/main.jsx` — interface e player
 
 
-## Deploy no Render
+## Atualização V8 — perfis, séries e capas
 
-O NeoPlayer está preparado para **Web Service** no Render.
+- Perfis locais com playlists separadas por perfil.
+- Organização de séries M3U por série → temporada → episódio com detecção ampliada de padrões.
+- Limpeza de títulos, URLs e ruído de nomes na interface.
+- Logo reconstruída no layout com marca transparente + texto, evitando fundos brancos.
+- Busca automática de capas para filmes e séries sem artwork.
+- Se `TMDB_API_KEY` estiver configurada, o NeoPlayer tenta o TMDB primeiro; sem a chave, usa TVMaze para séries e iTunes como fallback.
+- Para Render Web Service: `npm install && npm run build` / `npm start`.
 
-- Runtime: `Node`
-- Branch: `main`
-- Root Directory: vazio
-- Build Command: `npm install && npm run build`
-- Start Command: `npm start`
-- Health Check Path: `/health`
-- Publish Directory: **não preencher** (Web Service não usa Publish Directory como um Static Site)
+### Capas automáticas no Render
 
-O servidor `server.js` entrega o build Vite em `dist/` e mantém as rotas:
-- `/api/xtream`
-- `/api/proxy`
-- `/api/playlist`
-- `/api/artwork`
-
-O servidor escuta `0.0.0.0` e usa `process.env.PORT`, conforme exigido pelo Render.
+No serviço Render, em **Environment**, você pode adicionar `TMDB_API_KEY`. A chave não deve ser colocada no GitHub. O código continua funcionando sem ela usando os fallbacks.

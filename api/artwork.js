@@ -1,57 +1,91 @@
 // GET /api/artwork?title=...&type=movie|tv
 //
-// Looks up cover art for a movie/series title that came from the playlist
-// without one. Uses Apple's iTunes Search API, which is free and needs no
-// API key — it's a metadata catalog, not a store integration.
+// Artwork lookup strategy:
+// 1) TMDB when TMDB_API_KEY is configured on the server (best poster match).
+// 2) TVMaze for TV series (no key required).
+// 3) Apple iTunes Search as a broad fallback for movies/TV.
 //
-// Response is small and cached hard (7 days, browser + Vercel edge), since
-// the same title is looked up over and over across different playlists and
-// different episodes of the same series.
+// The client only calls this endpoint for titles that do not already have a
+// provider supplied logo/poster, so existing artwork is always preserved.
 
-function upsize(url) {
-  if (!url) return '';
-  // iTunes URLs look like .../100x100bb.jpg — bump to a real poster size.
-  return url.replace(/\/\d+x\d+bb(\.(jpg|png))/i, '/600x600bb$1');
+function cleanTitle(value) {
+  return String(value || '')
+    .replace(/https?:\/\/\S+/gi, ' ')
+    .replace(/www\.\S+/gi, ' ')
+    .replace(/\b(4k|uhd|fhd|hd|sd|2160p|1080p|720p|480p|h\.?265|h\.?264|hevc|x264|x265|10bit|hdr10?|dual[\s._-]?audio|dublado|legendado|web[\s._-]?rip|webdl|bluray|brrip|remux)\b/gi, ' ')
+    .replace(/[\[\]{}]/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+    .slice(0, 180);
 }
 
-async function lookup(term, entity, country) {
-  const q = new URLSearchParams({ term, media: entity === 'tvShow' ? 'tvShow' : 'movie', entity, limit: '1', country });
-  const r = await fetch(`https://itunes.apple.com/search?${q.toString()}`, {
+async function fetchJson(url, options = {}, timeoutMs = 7000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, { ...options, signal: controller.signal });
+    if (!r.ok) return null;
+    return await r.json().catch(() => null);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function tmdb(title, type) {
+  const key = process.env.TMDB_API_KEY;
+  if (!key) return null;
+  const endpoint = type === 'tv' ? 'tv' : 'movie';
+  for (const language of ['pt-BR', 'en-US']) {
+    const q = new URLSearchParams({ api_key: key, language, query: title, include_adult: 'false', page: '1' });
+    const data = await fetchJson(`https://api.themoviedb.org/3/search/${endpoint}?${q}`);
+    const hit = data?.results?.[0];
+    if (hit?.poster_path) {
+      return {
+        poster: `https://image.tmdb.org/t/p/w780${hit.poster_path}`,
+        name: hit.title || hit.name || title,
+        year: (hit.release_date || hit.first_air_date || '').slice(0, 4) || null,
+      };
+    }
+  }
+  return null;
+}
+
+async function tvmaze(title) {
+  const data = await fetchJson(`https://api.tvmaze.com/search/shows?q=${encodeURIComponent(title)}`);
+  const hit = data?.[0]?.show;
+  const poster = hit?.image?.original || hit?.image?.medium || '';
+  if (!poster) return null;
+  return { poster, name: hit.name || title, year: (hit.premiered || '').slice(0, 4) || null };
+}
+
+async function itunes(title, type, country) {
+  const entity = type === 'tv' ? 'tvShow' : 'movie';
+  const q = new URLSearchParams({ term: title, media: type === 'tv' ? 'tv' : 'movie', entity, limit: '1', country });
+  const data = await fetchJson(`https://itunes.apple.com/search?${q}`, {
     headers: { 'User-Agent': 'Mozilla/5.0 NeoPlayer artwork lookup' },
   });
-  if (!r.ok) return null;
-  const data = await r.json().catch(() => null);
   const hit = data?.results?.[0];
   if (!hit) return null;
-  const poster = upsize(hit.artworkUrl100 || hit.artworkUrl60 || '');
+  const source = hit.artworkUrl100 || hit.artworkUrl60 || '';
+  const poster = source.replace(/\/\d+x\d+bb(\.(jpg|png))/i, '/600x600bb$1');
   if (!poster) return null;
-  return { poster, name: hit.trackName || hit.collectionName || term, year: (hit.releaseDate || '').slice(0, 4) || null };
+  return { poster, name: hit.trackName || hit.collectionName || title, year: (hit.releaseDate || '').slice(0, 4) || null };
 }
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  const title = (req.query?.title || '').toString().trim().slice(0, 200);
+  const title = cleanTitle(req.query?.title);
   const type = req.query?.type === 'tv' ? 'tv' : 'movie';
   if (!title) return res.status(400).json({ error: 'Informe o título.' });
 
-  const entity = type === 'tv' ? 'tvShow' : 'movie';
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 8000);
+  let hit = await tmdb(title, type);
+  if (!hit && type === 'tv') hit = await tvmaze(title);
+  if (!hit) hit = await itunes(title, type, 'BR');
+  if (!hit) hit = await itunes(title, type, 'US');
+  if (!hit && type === 'tv') hit = await itunes(title, 'movie', 'US');
 
-  try {
-    let hit = await lookup(title, entity, 'BR').catch(() => null);
-    if (!hit) hit = await lookup(title, entity, 'US').catch(() => null);
-    // A series episode sometimes only matches as a movie in the catalog and
-    // vice-versa; try the other entity once before giving up.
-    if (!hit) hit = await lookup(title, entity === 'tvShow' ? 'movie' : 'tvShow', 'US').catch(() => null);
-
-    res.setHeader('Cache-Control', 'public, max-age=604800, stale-while-revalidate=2592000');
-    if (!hit) return res.status(200).json({ poster: null });
-    return res.status(200).json({ poster: hit.poster, name: hit.name, year: hit.year });
-  } catch {
-    res.setHeader('Cache-Control', 'public, max-age=3600');
-    return res.status(200).json({ poster: null });
-  } finally {
-    clearTimeout(timer);
-  }
+  res.setHeader('Cache-Control', 'public, max-age=604800, stale-while-revalidate=2592000');
+  return res.status(200).json(hit ? { poster: hit.poster, name: hit.name, year: hit.year } : { poster: null });
 }

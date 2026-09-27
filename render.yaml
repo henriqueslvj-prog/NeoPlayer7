@@ -7,3 +7,6 @@ services:
     startCommand: npm start
     healthCheckPath: /health
     autoDeployTrigger: commit
+    envVars:
+      - key: TMDB_API_KEY
+        sync: false
