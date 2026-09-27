@@ -1,0 +1,203 @@
+const DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36 NeoPlayer/8.0';
+
+function setCors(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range, Accept, Origin, Referer');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges, Content-Type');
+}
+
+function parseTarget(raw) {
+  if (!raw) throw new Error('URL ausente.');
+  const target = new URL(raw);
+  if (!['http:', 'https:'].includes(target.protocol)) throw new Error('A URL precisa usar HTTP ou HTTPS.');
+  const host = target.hostname.toLowerCase();
+  if (host === 'localhost' || host === '::1' || host === '0.0.0.0' || host.endsWith('.local') || host.endsWith('.internal')) {
+    throw new Error('Destino não permitido.');
+  }
+  const ip = host.match(/^(?:\d{1,3}\.){3}\d{1,3}$/)?.[0];
+  if (ip) {
+    const [a,b] = ip.split('.').map(Number);
+    if (a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254)) {
+      throw new Error('Destino privado não permitido.');
+    }
+  }
+  return target;
+}
+
+function proxyUrl(url, opts={}) { const q=new URLSearchParams({url}); if(opts.ua)q.set('ua',opts.ua); if(opts.ref)q.set('ref',opts.ref); return `/api/proxy?${q.toString()}`; }
+function looksLikeManifest(text, contentType='') { return /#EXTM3U/i.test(text.slice(0, 500)) || /mpegurl|m3u8/i.test(contentType); }
+
+function rewriteManifest(text, baseUrl, opts={}) {
+  text = text.replace(/URI="([^"]+)"/gi, (_, ref) => {
+    if (/^(data:|blob:|https?:\/\/.*\/api\/proxy\?url=)/i.test(ref)) return `URI="${ref}"`;
+    try { return `URI="${proxyUrl(new URL(ref, baseUrl).href, opts)}"`; } catch { return `URI="${ref}"`; }
+  });
+  return text.split(/\r?\n/).map(line => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) return line;
+    try {
+      if (/^(data:|blob:)/i.test(trimmed)) return line;
+      return proxyUrl(new URL(trimmed, baseUrl).href, opts);
+    } catch { return line; }
+  }).join('\n');
+}
+
+function isManifest(contentType, target) {
+  return /mpegurl|m3u8/i.test(contentType) || /\.m3u8(?:$|\?)/i.test(target.pathname + target.search);
+}
+
+async function streamBodyToResponse(body, res) {
+  if (!body) return res.end();
+  try {
+    for await (const chunk of body) {
+      if (!res.write(chunk)) await new Promise(resolve => res.once('drain', resolve));
+    }
+  } finally {
+    res.end();
+  }
+}
+
+export default async function handler(req, res) {
+  setCors(res);
+  if (req.method === 'OPTIONS') return res.status(204).end();
+
+  const raw = req.method === 'GET'
+    ? req.query?.url
+    : (typeof req.body === 'string' ? (()=>{try{return JSON.parse(req.body).url}catch{return ''}})() : req.body?.url);
+  if (!raw) return res.status(400).json({error:'Informe a URL.'});
+
+  let target;
+  try { target = parseTarget(raw); }
+  catch (e) { return res.status(400).json({error:e.message || 'URL inválida.'}); }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 55000);
+  try {
+    const range = req.headers.range;
+    const customUA = typeof req.query?.ua === 'string' ? req.query.ua.slice(0, 500) : '';
+    const customRef = typeof req.query?.ref === 'string' ? req.query.ref.slice(0, 2000) : '';
+    const headers = {
+      'User-Agent': customUA || DEFAULT_UA,
+      ...(customRef ? {'Referer': customRef} : {}),
+      'Accept': 'application/x-mpegURL, application/vnd.apple.mpegurl, video/mp4, video/*, */*',
+      'Accept-Encoding': 'identity'
+    };
+    if (range) headers.Range = range;
+
+    let upstream;
+    try {
+      upstream = await fetch(target.href, {redirect:'follow', signal:controller.signal, headers, cache:'no-store'});
+    } catch {
+      upstream = await fetch(target.href, {redirect:'follow', signal:controller.signal, headers:{'User-Agent':customUA||DEFAULT_UA,...(customRef?{'Referer':customRef}:{}),'Accept':'*/*','Accept-Encoding':'identity'}, cache:'no-store'});
+    }
+
+    if (!upstream.ok && upstream.status !== 206) {
+      return res.status(502).json({error:`Servidor de origem respondeu HTTP ${upstream.status}.`});
+    }
+
+    const contentType = upstream.headers.get('content-type') || '';
+    const finalUrl = upstream.url || target.href;
+
+    // Probe mode: the client needs to know which playback engine to use BEFORE
+    // handing the URL to hls.js. If it's raw MPEG-TS, hls.js would keep
+    // downloading an endless stream waiting for a manifest to finish — no error,
+    // no playback, just a growing request. Read only the first chunk and abort.
+    if (req.query?.probe) {
+      let kind = 'media';
+      try {
+        const reader = upstream.body.getReader();
+        const { value, done } = await reader.read();
+        const head = Buffer.from((value || new Uint8Array(0)).slice(0, 16)).toString('utf8').trimStart();
+        if (!done && /^#EXTM3U/i.test(head)) kind = 'hls';
+        else if (/mpegurl|m3u8/i.test(contentType)) kind = 'hls';
+        try { await reader.cancel(); } catch {}
+      } catch {
+        kind = /mpegurl|m3u8/i.test(contentType) ? 'hls' : 'media';
+      }
+      controller.abort();
+      res.setHeader('Cache-Control','no-store');
+      return res.status(200).json({ kind, contentType });
+    }
+
+    if (req.query?.mode === 'playlist') {
+      const content = await upstream.text();
+      if (!content.trim()) return res.status(502).json({error:'Playlist vazia.'});
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.setHeader('Cache-Control','no-store');
+      return res.status(200).json({content, finalUrl});
+    }
+
+    // Many Xtream/IPTV panels answer a "live/.../ID.m3u8" URL with raw MPEG-TS
+    // bytes instead of an actual HLS manifest. Deciding by file extension alone
+    // (the old isManifest() check) meant every live channel got its binary
+    // stream read with upstream.text() — either hanging on an endless live
+    // stream or getting corrupted, and then rejected as "not a valid manifest".
+    // Instead, peek at the first chunk that actually arrives and branch on it.
+    if (isManifest(contentType, target)) {
+      const reader = upstream.body.getReader();
+      const first = await reader.read();
+      const firstChunk = first.value || new Uint8Array(0);
+      const head = Buffer.from(firstChunk.slice(0, 16)).toString('utf8').trimStart();
+
+      if (!first.done && /^#EXTM3U/i.test(head)) {
+        // Real HLS manifest: accumulate the (small) text body and rewrite it.
+        let text = Buffer.from(firstChunk).toString('utf8');
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          text += Buffer.from(value).toString('utf8');
+          if (text.length > 4_000_000) break; // safety cap, manifests are tiny
+        }
+        if (!looksLikeManifest(text, contentType)) return res.status(502).json({error:'Resposta não parece ser um manifesto HLS válido.'});
+        const rewritten = rewriteManifest(text, finalUrl, {ua:customUA,ref:customRef});
+        res.statusCode = 200;
+        res.setHeader('Content-Type','application/vnd.apple.mpegurl');
+        res.setHeader('Cache-Control','no-store, no-cache, must-revalidate');
+        res.setHeader('Content-Length', Buffer.byteLength(rewritten));
+        return res.end(rewritten);
+      }
+
+      // Not actually a manifest — it's a raw media/TS stream mislabeled with a
+      // .m3u8 path. Pass it through as binary, starting with the bytes already
+      // read, instead of erroring out. This is what makes plain MPEG-TS live
+      // channels (very common on IPTV panels) work.
+      const status = upstream.status === 206 ? 206 : 200;
+      res.statusCode = status;
+      res.setHeader('Content-Type', contentType && !/mpegurl|m3u8/i.test(contentType) ? contentType : 'video/mp2t');
+      for (const h of ['content-length','content-range','accept-ranges','etag','last-modified']) {
+        const v = upstream.headers.get(h); if (v) res.setHeader(h, v);
+      }
+      res.setHeader('Cache-Control','no-store');
+      if (firstChunk.length && !res.write(Buffer.from(firstChunk))) await new Promise(resolve => res.once('drain', resolve));
+      if (first.done) return res.end();
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (!res.write(Buffer.from(value))) await new Promise(resolve => res.once('drain', resolve));
+        }
+      } finally {
+        res.end();
+      }
+      return;
+    }
+
+    // Critical: stream media instead of using arrayBuffer(). Large MP4/M4V/TS
+    // files must start playing as soon as the origin sends the first bytes.
+    const status = upstream.status === 206 ? 206 : 200;
+    res.statusCode = status;
+    res.setHeader('Content-Type', contentType || 'application/octet-stream');
+    for (const h of ['content-length','content-range','accept-ranges','etag','last-modified']) {
+      const v = upstream.headers.get(h); if (v) res.setHeader(h, v);
+    }
+    res.setHeader('Cache-Control','no-store');
+    return await streamBodyToResponse(upstream.body, res);
+  } catch (error) {
+    if (error?.name === 'AbortError') return res.status(504).json({error:'O servidor de origem demorou mais de 55 segundos para responder.'});
+    if (!res.headersSent) return res.status(502).json({error:'Não foi possível acessar o conteúdo de origem.'});
+    return res.end();
+  } finally {
+    clearTimeout(timer);
+  }
+}
